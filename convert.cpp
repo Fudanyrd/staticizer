@@ -135,14 +135,16 @@ struct RelocableFileBuilder
   size_t dynobj_section_size;
   Elf64_Addr init_addr;
   Elf64_Addr fini_addr;
+  Elf64_Xword init_size;
+  Elf64_Xword fini_size;
 
   // RelocableFileBuilder () : strtab (), shstrtab (), syms (), relas () {}
   RelocableFileBuilder (unsigned char *dynobj_section_data,
                         size_t dynobj_section_size, Elf64_Addr init_addr,
-                        Elf64_Addr fini_addr)
+                        Elf64_Addr fini_addr, Elf64_Xword init_size, Elf64_Xword fini_size)
       : syms (), relas (), dynobj_section_data (dynobj_section_data),
         dynobj_section_size (dynobj_section_size), init_addr (init_addr),
-        fini_addr (fini_addr)
+        fini_addr (fini_addr), init_size (init_size), fini_size (fini_size)
   {
   }
 
@@ -195,10 +197,10 @@ RelocableFileBuilder::dump (const char *opath)
       s.st_other = STV_DEFAULT;
       s.st_shndx = dynobj_section_index;
       s.st_value = init_addr;
-      s.st_size = sizeof (_init_fini_instructions);
+      s.st_size = init_size;
 
       init_rela.r_addend = 0;
-      init_rela.r_offset = 0x10;
+      init_rela.r_offset = 0x0;
       init_rela.r_info = ELF64_R_INFO (sym_idx, R_X86_64_64);
       symtab.push_back (s);
     }
@@ -211,9 +213,9 @@ RelocableFileBuilder::dump (const char *opath)
       s.st_other = STV_DEFAULT;
       s.st_shndx = dynobj_section_index;
       s.st_value = fini_addr;
-      s.st_size = sizeof (_init_fini_instructions);
+      s.st_size = fini_size;
       fini_rela.r_addend = 0;
-      fini_rela.r_offset = 0x10;
+      fini_rela.r_offset = 0x0;
       fini_rela.r_info = ELF64_R_INFO (sym_idx, R_X86_64_64);
       symtab.push_back (s);
     }
@@ -263,38 +265,38 @@ RelocableFileBuilder::dump (const char *opath)
     shdrs.push_back (shdr);
   }
 
-  /* Build .init section if .init is present. */
+  /* Build .init_array section if .init is present. */
   const int init_section_index = shdrs.size ();
   if (init_addr != 0)
     {
       Elf64_Shdr shdr;
-      shdr.sh_name = shstrtab.add (".init");
-      shdr.sh_type = SHT_PROGBITS;
-      shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+      shdr.sh_name = shstrtab.add (".init_array");
+      shdr.sh_type = SHT_INIT_ARRAY;
+      shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
       shdr.sh_addr = 0;
       shdr.sh_offset = 0; /* will be filled later */
-      shdr.sh_size = sizeof (_init_fini_instructions);
+      shdr.sh_size = sizeof (void *);
       shdr.sh_link = 0;
       shdr.sh_info = 0;
-      shdr.sh_addralign = 16;
+      shdr.sh_addralign = sizeof (void *);
       shdr.sh_entsize = 0;
       shdrs.push_back (shdr);
     }
 
-  /* Build .fini section if .fini is present. */
+  /* Build .fini_array section if .fini is present. */
   const int fini_section_index = shdrs.size ();
   if (fini_addr != 0)
     {
       Elf64_Shdr shdr;
-      shdr.sh_name = shstrtab.add (".fini");
-      shdr.sh_type = SHT_PROGBITS;
-      shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+      shdr.sh_name = shstrtab.add (".fini_array");
+      shdr.sh_type = SHT_FINI_ARRAY;
+      shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
       shdr.sh_addr = 0;
       shdr.sh_offset = 0; /* will be filled later */
-      shdr.sh_size = sizeof (_init_fini_instructions);
+      shdr.sh_size = sizeof (void *);
       shdr.sh_link = 0;
       shdr.sh_info = 0;
-      shdr.sh_addralign = 16;
+      shdr.sh_addralign = sizeof (void *);
       shdr.sh_entsize = 0;
       shdrs.push_back (shdr);
     }
@@ -319,7 +321,7 @@ RelocableFileBuilder::dump (const char *opath)
   if (init_addr != 0)
     {
       Elf64_Shdr shdr;
-      shdr.sh_name = shstrtab.add (".rela.init");
+      shdr.sh_name = shstrtab.add (".rela.init_array");
       shdr.sh_type = SHT_RELA;
       shdr.sh_flags = SHF_INFO_LINK;
       shdr.sh_addr = 0;
@@ -336,7 +338,7 @@ RelocableFileBuilder::dump (const char *opath)
   if (fini_addr != 0)
     {
       Elf64_Shdr shdr;
-      shdr.sh_name = shstrtab.add (".rela.fini");
+      shdr.sh_name = shstrtab.add (".rela.fini_array");
       shdr.sh_type = SHT_RELA;
       shdr.sh_flags = SHF_INFO_LINK;
       shdr.sh_addr = 0;
@@ -455,30 +457,32 @@ RelocableFileBuilder::dump (const char *opath)
   int next_sect = dynobj_section_index;
   xwrite_section (dynobj_section_data, shdrs[next_sect]);
   next_sect += 1;
-  /* .init */
+  /* .init_array */
   if (init_addr != 0)
     {
-      xwrite_section (_init_fini_instructions, shdrs[next_sect]);
+      void *my_nullptr = nullptr;
+      xwrite_section (&my_nullptr, shdrs[next_sect]);
       next_sect += 1;
     }
-  /* .fini */
+  /* .fini_array */
   if (fini_addr != 0)
     {
-      xwrite_section (_init_fini_instructions, shdrs[next_sect]);
+      void *my_nullptr = nullptr;
+      xwrite_section (&my_nullptr, shdrs[next_sect]);
       next_sect += 1;
     }
   /* .rela.dynobj */
   shdrs[next_sect].sh_link = symtab_idx;
   xwrite_section (dynobj_rela_tab.data (), shdrs[next_sect]);
   next_sect += 1;
-  /* .rela.init */
+  /* .rela.init_array */
   if (init_addr != 0)
     {
       shdrs[next_sect].sh_link = symtab_idx;
       xwrite_section (&init_rela, shdrs[next_sect]);
       next_sect += 1;
     }
-  /* .rela.fini */
+  /* .rela.fini_array */
   if (fini_addr != 0)
     {
       shdrs[next_sect].sh_link = symtab_idx;
@@ -672,7 +676,9 @@ main (int argc, char **argv)
   const char *shstrtab_start
       = (const char *)(fdata + shdrs[ehdr->e_shstrndx].sh_offset);
   Elf64_Addr init_addr = 0;
+  Elf64_Xword init_size = 0;
   Elf64_Addr fini_addr = 0;
+  Elf64_Xword fini_size = 0;
   for (int i = 0; i < shnum; i++)
     {
       const Elf64_Shdr *shdr = &shdrs[i];
@@ -680,19 +686,21 @@ main (int argc, char **argv)
       if (strcmp (name, ".init") == 0)
         {
           init_addr = shdr->sh_addr;
+          init_size = shdr->sh_size;
           assert (init_addr == 0
                   || (init_addr >= vaddr_min && init_addr < vaddr_max));
         }
       else if (strcmp (name, ".fini") == 0)
         {
           fini_addr = shdr->sh_addr;
+          fini_size = shdr->sh_size;
           assert (fini_addr == 0
                   || (fini_addr >= vaddr_min && fini_addr < vaddr_max));
         }
     }
 
   RelocableFileBuilder builder (dynobj_section_data, vaddr_max - vaddr_min,
-                                init_addr, fini_addr);
+                                init_addr, fini_addr, init_size, fini_size);
   builder.syms = std::move (syms);
   builder.relas = std::move (relas);
   builder.dump ("output.o");
