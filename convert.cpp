@@ -43,45 +43,53 @@ struct StringHash
 
 struct StringTable
 {
-  static bool
-  streq (const char *s, const char *t)
-  {
-    return strcmp (s, t) == 0;
-  }
-  std::unordered_map<const char *, size_t, StringHash,
-                     decltype (&StringTable::streq)>
-      map;
-  std::vector<char> data;
+  std::unordered_map<std::string, size_t> map;
+  /**
+   * Starting from 1 because 0 is reserved for the null string.
+   */
+  size_t next_index;
 
-  StringTable () : map (16, StringHash (), &StringTable::streq), data ()
+  size_t
+  add (const std::string &str)
   {
-    data.push_back ('\0');
+    if (__builtin_expect (str.empty (), false))
+      {
+        return 0;
+      }
+    auto iter = map.find (str);
+    if (iter != map.end ())
+      {
+        return iter->second;
+      }
+    size_t idx = next_index;
+    map[str] = idx;
+    next_index += str.size () + 1; /* +1 for null terminator */
+    return idx;
   }
+  StringTable () : map (), next_index (1) {}
 
   size_t
   size () const
   {
-    return data.size ();
+    return next_index;
   }
 
   /**
-   * Add a string to the table.
-   * @param str The string to add.
-   * @return The index of the string in the table.
+   * Get the data of the string table.
+   * @return The data of the string table.
    */
-  size_t
-  add (const char *str)
+  std::vector<char>
+  data () const
   {
-    auto it = map.find (str);
-    if (it != map.end ())
-      return it->second;
-
-    size_t idx = data.size ();
-    map[str] = idx;
-    while (*str)
-      data.push_back (*str++);
-    data.push_back ('\0');
-    return idx;
+    std::vector<char> ret (next_index, (char)0);
+    for (const auto &pair : map)
+      {
+        const std::string &str = pair.first;
+        size_t idx = pair.second;
+        assert (idx < next_index);
+        memcpy (ret.data () + idx, str.c_str (), str.size ());
+      }
+    return ret;
   }
 };
 
@@ -506,10 +514,10 @@ RelocableFileBuilder::dump (const char *opath)
   xwrite_section (symtab.data (), shdrs[next_sect]);
   next_sect += 1;
   /* .strtab */
-  xwrite_section (strtab.data.data (), shdrs[next_sect]);
+  xwrite_section (strtab.data ().data (), shdrs[next_sect]);
   next_sect += 1;
   /* .shstrtab */
-  xwrite_section (shstrtab.data.data (), shdrs[shstrtab_idx]);
+  xwrite_section (shstrtab.data ().data (), shdrs[shstrtab_idx]);
 
   /* Dump section table. */
   {
