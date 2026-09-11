@@ -114,6 +114,7 @@ extern "C"
     Elf64_Xword size;
     unsigned char info;
     unsigned char other;
+    unsigned char shndx_is_udf;
   };
   struct Rela
   {
@@ -147,6 +148,14 @@ struct RelocableFileBuilder
         fini_addr (fini_addr), init_size (init_size), fini_size (fini_size)
   {
   }
+
+ static Elf64_Word
+ reloc_type_convert (Elf64_Word orig_type)
+   {
+     if (orig_type == R_X86_64_GLOB_DAT ||
+         orig_type == R_X86_64_JUMP_SLOT) { return R_X86_64_64; }
+     return orig_type;
+   }
 
   void dump (const char *opath);
 };
@@ -227,7 +236,7 @@ RelocableFileBuilder::dump (const char *opath)
       s.st_name = name;
       s.st_info = sym.info;
       s.st_other = sym.other;
-      s.st_shndx = dynobj_section_index;
+      s.st_shndx = sym.shndx_is_udf ? 0 : dynobj_section_index;
       s.st_value = sym.value;
       s.st_size = sym.size;
       symtab.push_back (s);
@@ -243,7 +252,7 @@ RelocableFileBuilder::dump (const char *opath)
         }
       Elf64_Rela r;
       r.r_offset = rela.offset;
-      r.r_info = ELF64_R_INFO (sym_idx, rela.type);
+      r.r_info = ELF64_R_INFO (sym_idx, reloc_type_convert (rela.type));
       r.r_addend = rela.addend;
       dynobj_rela_tab.push_back (r);
     }
@@ -279,7 +288,7 @@ RelocableFileBuilder::dump (const char *opath)
       shdr.sh_link = 0;
       shdr.sh_info = 0;
       shdr.sh_addralign = sizeof (void *);
-      shdr.sh_entsize = 0;
+      shdr.sh_entsize = sizeof (void *);
       shdrs.push_back (shdr);
     }
 
@@ -297,7 +306,7 @@ RelocableFileBuilder::dump (const char *opath)
       shdr.sh_link = 0;
       shdr.sh_info = 0;
       shdr.sh_addralign = sizeof (void *);
-      shdr.sh_entsize = 0;
+      shdr.sh_entsize = sizeof (void *);
       shdrs.push_back (shdr);
     }
 
@@ -583,6 +592,8 @@ main (int argc, char **argv)
         }
     }
 
+  assert (vaddr_min == 0);
+
   /**
    * Create .dynobj section data.
    */
@@ -637,6 +648,7 @@ main (int argc, char **argv)
           s.size = sym->st_size;
           s.info = sym->st_info;
           s.other = sym->st_other;
+          s.shndx_is_udf = (unsigned char) (sym->st_shndx == 0);
           syms.push_back (s);
         }
     }
