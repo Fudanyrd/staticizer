@@ -130,6 +130,80 @@ extern "C"
 namespace
 {
 
+/**
+ * Partition syms such that the front segment of
+ * `syms` are evaluated to true by predicate.
+ * This is performed in-place and the field Rela::sym
+ * still points to the correct symbol (although the
+ * pointer value may change).
+ *
+ * After partition, symbol appears in the same
+ * order as the original input.
+ */
+template <typename Pred>
+void
+partition_sym_and_rela (std::vector<Sym> &syms, std::vector<Rela> &relas,
+                        const Pred &pred)
+{
+  const size_t num_syms = syms.size ();
+
+  /* Remember the original index of the symbol referenced by each
+     relocation, since the pointers will be invalidated once `syms` is
+     reordered. `num_syms` is used as a sentinel for symbol-less relocations.
+   */
+  std::vector<size_t> rela_sym_idx (relas.size ());
+  for (size_t i = 0; i < relas.size (); i++)
+    {
+      rela_sym_idx[i] = relas[i].sym == nullptr
+                            ? num_syms
+                            : (size_t)(relas[i].sym - syms.data ());
+    }
+
+  /* Stable-partition the indices so that the relative order of symbols is
+     preserved. */
+  std::vector<size_t> perm (num_syms);
+  for (size_t i = 0; i < num_syms; i++)
+    {
+      perm[i] = i;
+    }
+  std::stable_partition (
+      perm.begin (), perm.end (),
+      [&syms, &pred] (size_t idx) { return pred (syms[idx]); });
+
+  /* new_idx[old] is the position `old` ends up at after partitioning. */
+  std::vector<size_t> new_idx (num_syms);
+  for (size_t i = 0; i < num_syms; i++)
+    {
+      new_idx[perm[i]] = i;
+    }
+
+  /* Apply the permutation to `syms` in place. */
+  std::vector<Sym> old_syms = std::move (syms);
+  syms.resize (num_syms);
+  for (size_t i = 0; i < num_syms; i++)
+    {
+      syms[i] = old_syms[perm[i]];
+    }
+
+  /* Repoint relocations at their new location. */
+  for (size_t i = 0; i < relas.size (); i++)
+    {
+      if (relas[i].sym != nullptr)
+        {
+          relas[i].sym = syms.data () + new_idx[rela_sym_idx[i]];
+        }
+    }
+}
+
+struct SymIsLocalBind
+{
+  bool
+  operator() (const Sym &sym) const
+  {
+    return ELF64_ST_BIND (sym.info) == STB_LOCAL;
+  }
+};
+
 struct RelocableFileBuilder
 {
   std::vector<Sym> syms;
@@ -651,10 +725,6 @@ main (int argc, char **argv)
       for (int j = 1; j < num_syms; j++)
         {
           const Elf64_Sym *sym = &symtab[j];
-          if (sym->st_name == 0)
-            {
-              assert (0 && "unexpected null sym");
-            }
           Sym s;
           s.name = (const char *)(fdata + linked->sh_offset + sym->st_name);
           s.value = sym->st_value;
@@ -733,6 +803,7 @@ main (int argc, char **argv)
         }
     }
 
+  partition_sym_and_rela (syms, relas, SymIsLocalBind ());
   RelocableFileBuilder builder (dynobj_section_data, vaddr_max - vaddr_min);
   builder.syms = std::move (syms);
   builder.relas = std::move (relas);
