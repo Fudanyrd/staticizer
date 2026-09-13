@@ -381,13 +381,18 @@ RelocableFileBuilder::dump (const char *opath)
   for (const Sym &sym : syms)
     {
       auto name = strtab.add (sym.name);
+      const int sect_idx = section_index_of (sym.value);
+      const auto dynobj_sect_idx = dynobj_slot_of (sym.value);
       Elf64_Sym s;
       s.st_name = name;
       s.st_info = sym.info;
       s.st_other = sym.other;
-      s.st_shndx
-          = sym.shndx_is_udf ? 0 : (Elf64_Half)section_index_of (sym.value);
-      s.st_value = sym.value;
+      s.st_shndx = sym.shndx_is_udf ? 0 : (Elf64_Half)sect_idx;
+      /**
+       * For object file, the `st_value` field is the offset of the symbol from
+       * the beginning of of its section.
+       */
+      s.st_value = sym.value - dynobjs[dynobj_sect_idx].vaddr;
       s.st_size = sym.size;
       symtab.push_back (s);
     }
@@ -814,6 +819,15 @@ convert_so_to_reloc (const char *in_path, const char *out_path,
       dynobj.size = range.end - range.start;
       dynobj.vaddr = range.start;
       dynobjs.push_back (dynobj);
+    }
+  for (size_t i = 1; i < dynobjs.size (); i++)
+    {
+      auto &prev = dynobjs[i - 1];
+      const auto prev_end = prev.vaddr + prev.size;
+      const auto cur_start = dynobjs[i].vaddr;
+      assert (prev_end <= cur_start);
+      assert (cur_start % vaddr_align == 0);
+      prev.size = cur_start - prev.vaddr; /* shrink to fit */
     }
   for (size_t i = 0; i < dynobjs.size (); i++)
     {
