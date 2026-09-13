@@ -102,8 +102,6 @@ die (const char *s)
   exit (1);
 }
 
-static const char _dynobj_section_name[] = ".dynobj";
-
 extern "C"
 {
   /**
@@ -204,20 +202,32 @@ struct SymIsLocalBind
   }
 };
 
+/**
+ * A single `.dynobj.N` output section derived from a group of
+ * loadable segments sharing the same writability.
+ */
+struct DynobjInput
+{
+  std::string name;
+  bool writable;
+  const unsigned char *data;
+  size_t size;
+  Elf64_Addr vaddr;
+};
+
 struct RelocableFileBuilder
 {
   std::vector<Sym> syms;
   std::vector<Rela> relas;
-  unsigned char *dynobj_section_data;
-  size_t dynobj_section_size;
+  std::vector<DynobjInput> dynobjs;
   std::vector<Elf64_Addr> init_array;
   std::vector<Elf64_Addr> fini_array;
+  /* Section index of the first `.dynobj.N` section (set by dump). */
+  int dynobj_first_idx;
 
-  // RelocableFileBuilder () : strtab (), shstrtab (), syms (), relas () {}
-  RelocableFileBuilder (unsigned char *dynobj_section_data,
-                        size_t dynobj_section_size)
-      : syms (), relas (), dynobj_section_data (dynobj_section_data),
-        dynobj_section_size (dynobj_section_size)
+  explicit RelocableFileBuilder (std::vector<DynobjInput> dynobj_inputs)
+      : syms (), relas (), dynobjs (std::move (dynobj_inputs)),
+        dynobj_first_idx (1)
   {
   }
 
@@ -229,6 +239,41 @@ struct RelocableFileBuilder
         return R_X86_64_64;
       }
     return orig_type;
+  }
+
+  /**
+   * Section index holding `addr`, or 0 if the address is not covered by
+   * any `.dynobj` section.
+   */
+  int
+  section_index_of (Elf64_Addr addr) const
+  {
+    for (size_t i = 0; i < dynobjs.size (); i++)
+      {
+        if (addr >= dynobjs[i].vaddr
+            && addr < dynobjs[i].vaddr + dynobjs[i].size)
+          {
+            return dynobj_first_idx + (int)i;
+          }
+      }
+    return 0;
+  }
+
+  /**
+   * Index into `dynobjs` of the section holding `addr`, or -1.
+   */
+  int
+  dynobj_slot_of (Elf64_Addr addr) const
+  {
+    for (size_t i = 0; i < dynobjs.size (); i++)
+      {
+        if (addr >= dynobjs[i].vaddr
+            && addr < dynobjs[i].vaddr + dynobjs[i].size)
+          {
+            return (int)i;
+          }
+      }
+    return -1;
   }
 
   void dump (const char *opath);
@@ -265,48 +310,68 @@ RelocableFileBuilder::dump (const char *opath)
   shdrs.push_back (NULL_ENT);
   StringTable shstrtab;
 
+  const size_t num_dynobjs = dynobjs.size ();
+  assert (num_dynobjs > 0);
+
+  /* Build the `.dynobj.N` sections, one per writability group. */
+  const int dynobj_section_index = shdrs.size (); /* which is 1 */
+  dynobj_first_idx = dynobj_section_index;
+  for (const DynobjInput &dynobj : dynobjs)
+    {
+      Elf64_Shdr shdr;
+      shdr.sh_name = shstrtab.add (dynobj.name);
+      shdr.sh_type = SHT_PROGBITS;
+      shdr.sh_flags
+          = SHF_ALLOC | (dynobj.writable ? SHF_WRITE : SHF_EXECINSTR);
+      shdr.sh_addr = 0;
+      shdr.sh_offset = 0; /* will be filled later */
+      shdr.sh_size = dynobj.size;
+      shdr.sh_link = 0;
+      shdr.sh_info = 0;
+      shdr.sh_addralign = 0x1000;
+      shdr.sh_entsize = 0;
+      shdrs.push_back (shdr);
+    }
+
   StringTable strtab;
   std::vector<Elf64_Sym> symtab;
   symtab.push_back (NULL_SYM);
-  std::vector<Elf64_Rela> dynobj_rela_tab;
-  const int dynobj_section_index = shdrs.size (); /* which is 1 */
+  /* One relocation table per `.dynobj.N` section. */
+  std::vector<std::vector<Elf64_Rela> > dynobj_rela_tabs (num_dynobjs);
   /* Symbol for init and fini function. */
   std::vector<Elf64_Rela> init_relas; /* .rela.init_array */
-  std::vector<Elf64_Rela> fini_relas; /* .rela.init_array */
+  std::vector<Elf64_Rela> fini_relas; /* .rela.fini_array */
   {
-    auto build_sym_and_rela_for_entr
-        = [dynobj_section_index] (
-              std::vector<Elf64_Rela> &relas, std::vector<Elf64_Sym> &symtab,
-              StringTable &strtab, const char *name_prefix, Elf64_Addr entry) {
-            Elf64_Xword sym_idx = symtab.size ();
-            Elf64_Rela rela;
-            rela.r_addend = 0;
-            rela.r_info = ELF64_R_INFO (sym_idx, R_X86_64_64);
-            rela.r_offset = (/* count of existing array entrs */ relas.size ())
-                            * (sizeof (Elf64_Addr));
-            Elf64_Sym s;
+    auto build_sym_and_rela_for_entr =
+        [this, &symtab, &strtab] (std::vector<Elf64_Rela> &relas,
+                                  const char *name_prefix, Elf64_Addr entry) {
+          Elf64_Xword sym_idx = symtab.size ();
+          Elf64_Rela rela;
+          rela.r_addend = 0;
+          rela.r_info = ELF64_R_INFO (sym_idx, R_X86_64_64);
+          rela.r_offset = (/* count of existing array entrs */ relas.size ())
+                          * (sizeof (Elf64_Addr));
+          Elf64_Sym s;
 
-            s.st_name
-                = strtab.add (gen_uniq_name (strtab, name_prefix).c_str ());
-            s.st_info = ELF64_ST_INFO (STB_LOCAL, STT_FUNC); /* LOCAL + FUNC */
-            s.st_other = STV_DEFAULT;
-            s.st_shndx = dynobj_section_index;
-            s.st_value = entry;
-            s.st_size = 0; /* UNKNOWN */
+          s.st_name
+              = strtab.add (gen_uniq_name (strtab, name_prefix).c_str ());
+          s.st_info = ELF64_ST_INFO (STB_LOCAL, STT_FUNC); /* LOCAL + FUNC */
+          s.st_other = STV_DEFAULT;
+          s.st_shndx = (Elf64_Half)section_index_of (entry);
+          s.st_value = entry;
+          s.st_size = 0; /* UNKNOWN */
 
-            relas.push_back (rela);
-            symtab.push_back (s);
-          };
+          relas.push_back (rela);
+          symtab.push_back (s);
+        };
 
     for (Elf64_Addr entry : init_array)
       {
-        build_sym_and_rela_for_entr (init_relas, symtab, strtab, "_init",
-                                     entry);
+        build_sym_and_rela_for_entr (init_relas, "_init", entry);
       }
     for (Elf64_Addr entry : fini_array)
       {
-        build_sym_and_rela_for_entr (fini_relas, symtab, strtab, "_fini",
-                                     entry);
+        build_sym_and_rela_for_entr (fini_relas, "_fini", entry);
       }
     assert (fini_relas.size () == fini_array.size ());
     assert (init_relas.size () == init_array.size ());
@@ -320,13 +385,19 @@ RelocableFileBuilder::dump (const char *opath)
       s.st_name = name;
       s.st_info = sym.info;
       s.st_other = sym.other;
-      s.st_shndx = sym.shndx_is_udf ? 0 : dynobj_section_index;
+      s.st_shndx
+          = sym.shndx_is_udf ? 0 : (Elf64_Half)section_index_of (sym.value);
       s.st_value = sym.value;
       s.st_size = sym.size;
       symtab.push_back (s);
     }
   for (const Rela &rela : relas)
     {
+      int slot = dynobj_slot_of (rela.offset);
+      if (slot < 0)
+        {
+          die ("relocation offset lies outside all .dynobj sections\n");
+        }
       Elf64_Xword sym_idx = 0;
       if (rela.sym)
         {
@@ -335,27 +406,12 @@ RelocableFileBuilder::dump (const char *opath)
           sym_idx += dynobj_symbols_start_idx;
         }
       Elf64_Rela r;
-      r.r_offset = rela.offset;
+      /* `r_offset` is relative to the beginning of the containing section. */
+      r.r_offset = rela.offset - dynobjs[slot].vaddr;
       r.r_info = ELF64_R_INFO (sym_idx, reloc_type_convert (rela.type));
       r.r_addend = rela.addend;
-      dynobj_rela_tab.push_back (r);
+      dynobj_rela_tabs[slot].push_back (r);
     }
-
-  /* Build .dynobj section. */
-  {
-    Elf64_Shdr shdr;
-    shdr.sh_name = shstrtab.add (_dynobj_section_name);
-    shdr.sh_type = SHT_PROGBITS;
-    shdr.sh_flags = SHF_ALLOC | SHF_WRITE | SHF_EXECINSTR;
-    shdr.sh_addr = 0;
-    shdr.sh_offset = 0; /* will be filled later */
-    shdr.sh_size = dynobj_section_size;
-    shdr.sh_link = 0;
-    shdr.sh_info = 0;
-    shdr.sh_addralign = 0x1000;
-    shdr.sh_entsize = 0;
-    shdrs.push_back (shdr);
-  }
 
   /* Build .init_array section if .init is present. */
   const int init_section_index = shdrs.size ();
@@ -393,21 +449,23 @@ RelocableFileBuilder::dump (const char *opath)
       shdrs.push_back (shdr);
     }
 
-  /* Build .rela.dynobj section */
-  {
-    Elf64_Shdr shdr;
-    shdr.sh_name = shstrtab.add (".rela.dynobj");
-    shdr.sh_type = SHT_RELA;
-    shdr.sh_flags = SHF_INFO_LINK;
-    shdr.sh_addr = 0;
-    shdr.sh_offset = 0; /* will be filled later */
-    shdr.sh_size = sizeof (Elf64_Rela) * dynobj_rela_tab.size ();
-    shdr.sh_link = 0; /* will be filled later (to .symtab section) */
-    shdr.sh_info = dynobj_section_index;
-    shdr.sh_addralign = 8;
-    shdr.sh_entsize = sizeof (Elf64_Rela);
-    shdrs.push_back (shdr);
-  }
+  /* Build .rela.dynobj.N sections. */
+  const int rela_dynobj_section_index = shdrs.size ();
+  for (size_t i = 0; i < num_dynobjs; i++)
+    {
+      Elf64_Shdr shdr;
+      shdr.sh_name = shstrtab.add (".rela" + dynobjs[i].name);
+      shdr.sh_type = SHT_RELA;
+      shdr.sh_flags = SHF_INFO_LINK;
+      shdr.sh_addr = 0;
+      shdr.sh_offset = 0; /* will be filled later */
+      shdr.sh_size = sizeof (Elf64_Rela) * dynobj_rela_tabs[i].size ();
+      shdr.sh_link = 0; /* will be filled later (to .symtab section) */
+      shdr.sh_info = dynobj_section_index + i;
+      shdr.sh_addralign = 8;
+      shdr.sh_entsize = sizeof (Elf64_Rela);
+      shdrs.push_back (shdr);
+    }
 
   /* Build .rela.init section if .init is present. */
   if (!init_array.empty ())
@@ -435,7 +493,7 @@ RelocableFileBuilder::dump (const char *opath)
       shdr.sh_flags = SHF_INFO_LINK;
       shdr.sh_addr = 0;
       shdr.sh_offset = 0; /* will be filled later */
-      shdr.sh_size = fini_array.size () * sizeof (Elf64_Rela);
+      shdr.sh_size = fini_relas.size () * sizeof (Elf64_Rela);
       shdr.sh_link = 0; /* will be filled later */
       shdr.sh_info = fini_section_index;
       shdr.sh_addralign = 8;
@@ -546,10 +604,13 @@ RelocableFileBuilder::dump (const char *opath)
     offset += size;
   };
 
-  /* .dynobj */
+  /* .dynobj.N */
   int next_sect = dynobj_section_index;
-  xwrite_section (dynobj_section_data, shdrs[next_sect]);
-  next_sect += 1;
+  for (size_t i = 0; i < num_dynobjs; i++)
+    {
+      xwrite_section (dynobjs[i].data, shdrs[next_sect]);
+      next_sect += 1;
+    }
   /* .init_array */
   if (!init_array.empty ())
     {
@@ -566,10 +627,13 @@ RelocableFileBuilder::dump (const char *opath)
       xwrite_section (dat.data (), shdrs[next_sect]);
       next_sect += 1;
     }
-  /* .rela.dynobj */
-  shdrs[next_sect].sh_link = symtab_idx;
-  xwrite_section (dynobj_rela_tab.data (), shdrs[next_sect]);
-  next_sect += 1;
+  /* .rela.dynobj.N */
+  for (size_t i = 0; i < num_dynobjs; i++)
+    {
+      shdrs[next_sect].sh_link = symtab_idx;
+      xwrite_section (dynobj_rela_tabs[i].data (), shdrs[next_sect]);
+      next_sect += 1;
+    }
   /* .rela.init_array */
   if (!init_array.empty ())
     {
@@ -629,16 +693,22 @@ RelocableFileBuilder::dump (const char *opath)
 
 } /* (anonymous namespace) */
 
-int
-main (int argc, char **argv)
+/**
+ * Convert a shared object into a relocatable object.
+ *
+ * @param in_path    Path of the input shared object.
+ * @param out_path   Path of the output relocatable object.
+ * @param sect_number First number to use for the generated `.dynobj`
+ *                    section names. Sections are named `.dynobj.N`,
+ *                    `.dynobj.N+1`, ...
+ * @return The next usable `.dynobj` section number, so that successive
+ *         calls can keep their section names distinct.
+ */
+extern "C" unsigned int
+convert_so_to_reloc (const char *in_path, const char *out_path,
+                     unsigned int sect_number)
 {
-  const char *input = argv[1];
-  if (input == nullptr)
-    {
-      die ("usage: <input shared object>\n");
-    }
-
-  int fd = open (input, O_RDONLY);
+  int fd = open (in_path, O_RDONLY);
   struct stat stbuf;
   if (fd < 0)
     {
@@ -681,22 +751,79 @@ main (int argc, char **argv)
   assert (vaddr_min == 0);
 
   /**
-   * Create .dynobj section data.
+   * Create the contiguous image of all loadable segments.
    */
-  unsigned char *dynobj_section_data
-      = new unsigned char[vaddr_max - vaddr_min];
-  std::unique_ptr<unsigned char[]> _dynobj_section_data_guard (
-      dynobj_section_data);
-  memset (dynobj_section_data, 0, vaddr_max - vaddr_min);
+  unsigned char *load_image = new unsigned char[vaddr_max - vaddr_min];
+  std::unique_ptr<unsigned char[]> _load_image_guard (load_image);
+  memset (load_image, 0, vaddr_max - vaddr_min);
   for (int i = 0; i < ehdr->e_phnum; i++)
     {
       const Elf64_Phdr *phdr = &phdrs[i];
       if (phdr->p_type == PT_LOAD)
         {
-          memcpy (dynobj_section_data + phdr->p_vaddr - vaddr_min,
+          memcpy (load_image + phdr->p_vaddr - vaddr_min,
                   fdata + phdr->p_offset, phdr->p_filesz);
         }
     }
+
+  /**
+   * Group loadable segments by writability so that each resulting
+   * `.dynobj.N` section is either writable or executable, never both.
+   */
+  struct LoadRange
+  {
+    Elf64_Addr start;
+    Elf64_Addr end;
+    bool writable;
+  };
+  std::vector<LoadRange> ranges;
+  for (int i = 0; i < ehdr->e_phnum; i++)
+    {
+      const Elf64_Phdr *phdr = &phdrs[i];
+      if (phdr->p_type != PT_LOAD)
+        {
+          continue;
+        }
+      LoadRange range;
+      range.start = phdr->p_vaddr & ~(vaddr_align - 1);
+      range.start = std::max (range.start, vaddr_min);
+      range.end = phdr->p_vaddr + phdr->p_memsz;
+      range.writable = (phdr->p_flags & PF_W) != 0;
+      ranges.push_back (range);
+    }
+  std::sort (ranges.begin (), ranges.end (),
+             [] (const LoadRange &a, const LoadRange &b) {
+               return a.start < b.start;
+             });
+
+  std::vector<DynobjInput> dynobjs;
+  for (const LoadRange &range : ranges)
+    {
+      if (!dynobjs.empty () && dynobjs.back ().writable == range.writable)
+        {
+          Elf64_Addr cur_end = dynobjs.back ().vaddr + dynobjs.back ().size;
+          if (range.end > cur_end)
+            {
+              dynobjs.back ().size = range.end - dynobjs.back ().vaddr;
+            }
+          continue;
+        }
+      DynobjInput dynobj;
+      dynobj.writable = range.writable;
+      dynobj.data = nullptr;
+      dynobj.size = range.end - range.start;
+      dynobj.vaddr = range.start;
+      dynobjs.push_back (dynobj);
+    }
+  for (size_t i = 0; i < dynobjs.size (); i++)
+    {
+      char name[64];
+      snprintf (name, sizeof (name), ".dynobj.%u", sect_number + (unsigned)i);
+      dynobjs[i].name = name;
+      dynobjs[i].data = load_image + (dynobjs[i].vaddr - vaddr_min);
+    }
+  const unsigned int next_section_number
+      = sect_number + (unsigned int)dynobjs.size ();
 
   const Elf64_Shdr *shdrs = (const Elf64_Shdr *)(fdata + ehdr->e_shoff);
   int shnum = ehdr->e_shnum;
@@ -804,12 +931,40 @@ main (int argc, char **argv)
     }
 
   partition_sym_and_rela (syms, relas, SymIsLocalBind ());
-  RelocableFileBuilder builder (dynobj_section_data, vaddr_max - vaddr_min);
+  RelocableFileBuilder builder (std::move (dynobjs));
   builder.syms = std::move (syms);
   builder.relas = std::move (relas);
   builder.init_array = std::move (init_array);
   builder.fini_array = std::move (fini_array);
-  builder.dump ("output.o");
+  builder.dump (out_path);
+
+  return next_section_number;
+}
+
+int
+main (int argc, char **argv)
+{
+  if (argc < 3)
+    {
+      die ("usage: convert <input shared object> <output object> "
+           "[section-number]\n");
+    }
+
+  const char *input = argv[1];
+  const char *output = argv[2];
+  unsigned int sect_number = 1;
+  if (argc >= 4)
+    {
+      char *end = nullptr;
+      unsigned long parsed = strtoul (argv[3], &end, 0);
+      if (end == argv[3] || *end != '\0' || parsed > 0xfffful)
+        {
+          die ("invalid section number\n");
+        }
+      sect_number = (unsigned int)parsed;
+    }
+
+  convert_so_to_reloc (input, output, sect_number);
 
   return 0;
 }
